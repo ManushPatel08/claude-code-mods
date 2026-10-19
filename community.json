@@ -71,6 +71,15 @@
       "url": "https://github.com/air01aditya/pixel-pulse",
       "description": "A purple pixel strip above the prompt that drifts right to left and glows under the pointer, and a purple pixel spiral in place of the working spinner. Desktop app only; it only draws",
       "tags": ["band"]
+    },
+    {
+      "name": "open-paths",
+      "marketplace": "open-paths",
+      "repo": "kiankhooban/open-paths",
+      "author": "kiankhooban",
+      "url": "https://github.com/kiankhooban/open-paths",
+      "description": "Click a file path in Claude's reply and the file opens in its app: Word, Preview or Excel for documents, your editor at the line for app.py:42, Finder for folders. Launchers, scripts and unknown types are never opened",
+      "tags": []
     }
   ]
 }
