@@ -169,7 +169,7 @@ export const register: Register = on => {
       <Box flexDirection="row" gap={1}>
         <Button key="who" label="Who" hotkey="w" variant={v === 'who' ? 'primary' : undefined} onPress={() => update($, view, () => 'who')} />
         <Button key="code" label="Code" hotkey="c" variant={v === 'code' ? 'primary' : undefined} onPress={() => void setCode($)} />
-        {v === 'code' && isWindows && <Button key="open" label="Browser" hotkey="b" onPress={() => openPage($)} />}
+        {v === 'code' && isWindows && <Button key="open" label="Browser" hotkey="b" onPress={() => void openPage($).catch(() => {})} />}
         <Button key="close" label="Close" hotkey="q" role="dismiss" onPress={() => $.ui.close({ id: PANE })} />
       </Box>
     )
@@ -192,6 +192,7 @@ export const register: Register = on => {
           <Box flexDirection="column">
             {head}
             <Text dimColor>{`${list.length} files · ${changed} changed · b: the drawn map in your browser`}</Text>
+            {draw.error !== '' && <Text color="red">{draw.error}</Text>}
             {ls.length === 0 && <Text dimColor>Files Claude reads or edits show up here.</Text>}
             {ls.slice(0, rows - 1).map(l => (
               <Text wrap="truncate-end">
@@ -389,7 +390,7 @@ async function renderMap($: EngineInterface) {
 
 async function pagePath($: EngineInterface) {
   const tmp = ((await $.env.get('TEMP')) ?? 'C:\\Windows\\Temp').replace(/\\$/, '')
-  return `${tmp}\\mission-control\\map.html`
+  return `${tmp}\\mission-control-map.html` // right in TEMP, which always exists: the engine makes no folders
 }
 
 // The drawn map as a page the browser reloads: no Chrome to run, the browser draws the SVG.
@@ -399,7 +400,15 @@ async function renderPage($: EngineInterface) {
 
 // Opens the drawn map in the default browser; from then on each change redraws it.
 async function openPage($: EngineInterface) {
+  try {
+    await renderPage($)
+  } catch {
+    draw.isPageOpen = false
+    draw.error = `Could not write ${await pagePath($)}.`
+    await update($, now, () => Date.now()) // redraw the pane with the message
+    return
+  }
   draw.isPageOpen = true
-  await renderPage($)
+  draw.error = ''
   await $.process.run(['explorer.exe', await pagePath($)]).catch(() => {}) // explorer exits 1 even when it opened the page
 }
