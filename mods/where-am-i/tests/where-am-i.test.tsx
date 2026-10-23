@@ -7,14 +7,16 @@ const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: f
 const wait = () => new Promise(done => (globalThis as any).setTimeout(done, 10))
 
 // Stands for the engine beneath the mod.
-function engine(on: any, reply: string, beneath?: unknown) {
+// `reply` is Haiku's text, or a handler that answers `model.complete` itself.
+function engine(on: any, reply: string | (() => unknown), beneath?: unknown) {
   on('session.start', (_$: any, e: any) => ({ sessionId: 's', cwd: e.cwd }))
   on('command.register', () => ({ value: undefined }))
   on('prompt.submit', () => ({ text: '' }))
   on('tool.call', () => ({ result: {}, text: 'ok' }))
   on('turn.complete', () => ({ text: '' }))
+  on('turn.start', (_$: any, e: any) => ({ turnId: e.turnId }))
   on('agent.list', () => ({ value: [{ id: 'a1', description: 'sweep runner', type: 'general-purpose', status: 'running' }] }))
-  on('model.complete', () => ({ value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1 } } }))
+  on('model.complete', typeof reply === 'function' ? reply : () => ({ value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1 } } }))
   on('session.messages', () => ({ value: [{ role: 'user', text: 'build the mods', toolUses: [] }] }))
   on('ui.render', ($: any, e: any) => {
     if (beneath) return beneath
@@ -37,6 +39,59 @@ describe('where-am-i', () => {
     expect(await ui.find({ type: 'Text', text: /^built Where Am I$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /waiting on you: you to test it/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /band below/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('sending a message clears waiting on you at once', async ($, on) => {
+    engine(on, '{"goal":"Ship 3 mods","now":"asked to test","waiting":"you to test it","next":""}')
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+    await $.turn.complete({ reason: 'answer', answer: 'please test it', durationMs: 1 } as any)
+    await wait()
+
+    await $.prompt.submit({ text: 'tested, it works' } as any)
+    const ui = await $.ui.mount({ plugin: 'where-am-i', surface: 'terminal', ...BAND } as any)
+    expect(await ui.find({ type: 'Text', text: /^Ship 3 mods$/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /waiting on you/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  // Haiku holds its recap until `answer` is called.
+  function slowHaiku(on: any) {
+    const held = { answer: (_text: string) => {} }
+    engine(on, () => new Promise(done => (held.answer = text => done({ value: { isAnswered: true, text, usage: { input_tokens: 1, output_tokens: 1 } } }))))
+    return held
+  }
+  const OLD = '{"goal":"Ship 3 mods","now":"old turn","waiting":"you to test it","next":""}'
+
+  test('a summary that lands after the next turn starts is dropped', async ($, on) => {
+    const haiku = slowHaiku(on)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+    await $.prompt.submit({ text: 'ship all 3' } as any)
+    await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'done', durationMs: 1 } as any)
+    await wait()
+
+    // Haiku is still writing the recap when the next turn starts.
+    await $.prompt.submit({ text: 'now the next one' } as any)
+    await $.turn.start({ turnId: 't2' } as any)
+    haiku.answer(OLD)
+    await wait()
+    const ui = await $.ui.mount({ plugin: 'where-am-i', surface: 'terminal', ...BAND } as any)
+    expect(await ui.find({ type: 'Text', text: /old turn|waiting on you/ })).toBeUndefined()
+    await ui.unmount()
+  })
+
+  test('a slash command while Haiku writes keeps its summary', async ($, on) => {
+    const haiku = slowHaiku(on)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' } as any)
+    await $.prompt.submit({ text: 'ship all 3' } as any)
+    await $.turn.complete({ turnId: 't1', reason: 'answer', answer: 'done', durationMs: 1 } as any)
+    await wait()
+
+    await $.prompt.submit({ text: '/where' } as any) // starts no turn of Claude's
+    haiku.answer(OLD)
+    await wait()
+    const ui = await $.ui.mount({ plugin: 'where-am-i', surface: 'terminal', ...BAND } as any)
+    expect(await ui.find({ type: 'Text', text: /waiting on you: you to test it/ })).toBeDefined() // now shows the live line meanwhile
     await ui.unmount()
   })
 

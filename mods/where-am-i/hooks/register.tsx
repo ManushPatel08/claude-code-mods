@@ -11,6 +11,8 @@ const MAX_LOG = 20
 // Held by the host, so the recap survives a hot reload of this file.
 const recap = atom({ plugin: 'where-am-i', key: 'recap' } as const, null as Recap | null)
 const live = atom({ plugin: 'where-am-i', key: 'live' } as const, '')
+// The turn a summary may still land for. Held by the host too, so a summary from before a hot reload sees a newer turn.
+const latest = atom({ plugin: 'where-am-i', key: 'turn' } as const, '')
 // True while the next-steps mod shows its list of next prompts: this band leaves out its own next meanwhile.
 const nextStepsActive = { plugin: 'next-steps', key: 'active' } as const
 
@@ -41,6 +43,16 @@ export const register: Register = on => {
     prompt = e.text.slice(0, 1500)
     log = []
     await update($, live, () => 'reading your message')
+    if (!e.text.startsWith('/')) await clearWaiting($) // a slash command like /where answers nothing the last turn waited on
+    return next(e)
+  })
+
+  // A new turn of Claude's own: a summary of an older one is stale, and the person has answered.
+  on('turn.start', async ($, e, next) => {
+    if (!e.agentId) {
+      await update($, latest, () => e.turnId ?? '')
+      await clearWaiting($)
+    }
     return next(e)
   })
 
@@ -60,7 +72,10 @@ export const register: Register = on => {
     const r = await next(e)
     if (!e.agentId) {
       await update($, live, () => '')
-      void summarize($, prompt, log, e.answer).catch(() => {}) // in the background, so the turn ends at once
+      const mine = e.turnId ?? ''
+      await update($, latest, () => mine) // also for a turn that raised no turn.start, and after a hot reload
+      const isCurrent = async () => (await read($, latest)) === mine
+      void summarize($, prompt, log, e.answer, isCurrent).catch(() => {}) // in the background, so the turn ends at once
     }
     return r
   })
@@ -114,7 +129,7 @@ export function describe(e: Record<string, unknown>): string {
   return `using ${tool}`
 }
 
-async function summarize($: EngineInterface, prompt: string, log: string[], answer: string) {
+async function summarize($: EngineInterface, prompt: string, log: string[], answer: string, isCurrent: () => Promise<boolean>) {
   const before = await read($, recap)
   const r = await $.model.complete({
     model: MODEL,
@@ -132,9 +147,14 @@ async function summarize($: EngineInterface, prompt: string, log: string[], answ
       `The assistant's reply: ${answer.slice(0, 2500)}`,
     ].join('\n\n'),
   })
-  if (!r.isAnswered) return
+  if (!r.isAnswered || !(await isCurrent())) return // a newer turn started while Haiku was writing: this recap is stale
   const parsed = parseRecap(r.text)
   if (parsed) await update($, recap, () => parsed)
+}
+
+// The person just answered: whatever the last turn waited on is no longer theirs to do.
+async function clearWaiting($: EngineInterface) {
+  await update($, recap, r => (r && r.waiting !== '' ? { ...r, waiting: '' } : r))
 }
 
 async function longRecap($: EngineInterface, prompt: string, log: string[]) {
