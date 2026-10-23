@@ -3,9 +3,18 @@ import { describe, expect, test } from 'claude-code/testing'
 import { cdOf, pii, undash } from '../hooks/register'
 
 // Stands for the engine beneath the mod: records what ran, answers the dialog, fakes the repo.
-function engine(on: any, opts: { answer?: string; ruffFails?: boolean } = {}) {
+type Opts = {
+  answer?: string
+  ruffFails?: boolean
+  diff?: string
+  prettier?: { tracked?: string; realPath?: string; fails?: boolean }
+}
+
+function engine(on: any, opts: Opts = {}) {
   const ran: any[] = []
   const asked: string[] = []
+  const runs: { argv: string[]; cwd?: string }[] = []
+  const toasts: string[] = []
   on('tool.call', { tool: 'AskUserQuestion' }, (_$: any, e: any) => {
     asked.push(JSON.stringify(e))
     const question = e.questions[0].question
@@ -15,13 +24,30 @@ function engine(on: any, opts: { answer?: string; ruffFails?: boolean } = {}) {
     if (e.tool !== 'AskUserQuestion') ran.push(e)
     return { result: {}, text: 'ok' }
   })
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$: any, e: any) => {
+    toasts.push(JSON.stringify(e))
+    return { value: undefined }
+  })
   on('env.get', () => ({ value: '/Users/me' }))
-  on('fs.exists', () => ({ value: false }))
+  on('session.cwd', () => ({ value: '/repo' }))
+  on('fs.exists', (_$: any, e: any) => ({ value: opts.prettier !== undefined && e.path === '/repo/node_modules/.bin/prettier' }))
+  on('fs.stat', (_$: any, e: any) => {
+    const real = e.path === '/repo/node_modules/.bin/prettier' ? (opts.prettier?.realPath ?? '/repo/node_modules/prettier/bin/prettier.cjs') : e.path.replace(/\/[^/]+\/\.\.(?=\/|$)/g, '')
+    return { value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false, realPath: real } }
+  })
   on('process.run', (_$: any, e: any) => {
-    const [cmd, ...args] = e.argv as string[]
+    runs.push({ argv: [...e.argv], cwd: e.init?.cwd })
+    const [cmd, ...rest] = e.argv as string[]
+    const args = cmd === 'git' ? withoutOptions(rest) : rest
     if (cmd === 'git' && args[0] === 'rev-parse') return { value: { exitCode: 0, stdout: '/repo\n', stderr: '' } }
-    if (cmd === 'git' && args[0] === 'diff') return { value: { exitCode: 0, stdout: 'api/app.py\nREADME.md\n', stderr: '' } }
+    if (cmd === 'git' && args[0] === 'diff') return { value: { exitCode: 0, stdout: opts.diff ?? 'api/app.py\nREADME.md\n', stderr: '' } }
+    if (cmd === 'git' && args[0] === 'ls-files') {
+      const t = opts.prettier?.tracked // listed only when a pathspec covers it, as git does
+      const listed = t !== undefined && args.slice(args.indexOf('--') + 1).some(p => t === p || t.startsWith(`${p}/`))
+      return { value: { exitCode: 0, stdout: listed ? `${t}\n` : '', stderr: '' } }
+    }
+    if (cmd.endsWith('/prettier') && opts.prettier?.fails) throw new Error('spawn failed')
+    if (cmd.endsWith('/prettier')) return { value: { exitCode: 1, stdout: '', stderr: '[warn] web/app.ts\n' } }
     if (cmd === 'ruff') {
       return opts.ruffFails
         ? { value: { exitCode: 1, stdout: 'Would reformat: api/app.py\n1 file would be reformatted', stderr: '' } }
@@ -29,7 +55,14 @@ function engine(on: any, opts: { answer?: string; ruffFails?: boolean } = {}) {
     }
     return { value: { exitCode: 0, stdout: '', stderr: '' } }
   })
-  return { ran, asked }
+  return { ran, asked, runs, toasts }
+}
+
+// The git subcommand and its arguments, past any `-c k=v` / `-C dir` global options.
+function withoutOptions(args: string[]) {
+  let i = 0
+  while (args[i] === '-c' || args[i] === '-C') i += 2
+  return args.slice(i)
 }
 
 describe('rulebook-guard', () => {
@@ -102,5 +135,68 @@ describe('rulebook-guard', () => {
     expect(asked[0]).not.toMatch(/a\.b@example\.com/) // the value itself is never shown
     expect(r.deny).toMatch(/^rulebook-guard: the user blocked writing an email address .*Personal info needs the user's approval first\./)
     expect(ran.filter(e => e.tool === 'Write')).toEqual([])
+  })
+
+  test('a prettier the repo tracks in git is never run, and the push says so', async ($, on) => {
+    const { ran, asked, runs, toasts } = engine(on, { diff: 'web/app.ts\n', prettier: { tracked: 'node_modules/.bin/prettier' } })
+    await $.tool.call({ tool: 'Bash', command: 'git push' } as any)
+    expect(runs.filter(r => r.argv[0].endsWith('prettier'))).toEqual([])
+    expect(toasts.join()).toMatch(/Prettier not checked/)
+    expect(asked).toEqual([])
+    expect(ran.map(e => e.command)).toEqual(['git push'])
+  })
+
+  test('a prettier that resolves outside the repo node_modules is never run', async ($, on) => {
+    const { runs, toasts } = engine(on, { diff: 'web/app.ts\n', prettier: { realPath: '/tmp/evil/prettier' } })
+    await $.tool.call({ tool: 'Bash', command: 'git push' } as any)
+    expect(runs.filter(r => r.argv[0].endsWith('prettier'))).toEqual([])
+    expect(toasts.join()).toMatch(/Prettier not checked/)
+  })
+
+  test('a file the repo tracks deeper in node_modules also stops prettier', async ($, on) => {
+    const { runs, toasts } = engine(on, { diff: 'web/app.ts\n', prettier: { tracked: 'node_modules/prettier/index.cjs' } })
+    await $.tool.call({ tool: 'Bash', command: 'git push' } as any)
+    expect(runs.filter(r => r.argv[0].endsWith('prettier'))).toEqual([])
+    expect(toasts.join()).toMatch(/ships its own/)
+  })
+
+  test('a file named like a flag reaches prettier and ruff as a file', async ($, on) => {
+    const { runs } = engine(on, { answer: 'Block it', diff: '--plugin=./x.js\napi/app.py\n', prettier: {} })
+    await $.tool.call({ tool: 'Bash', command: 'git push' } as any)
+    const prettier = runs.find(r => r.argv[0].endsWith('prettier'))!.argv
+    expect(prettier.slice(1)).toEqual(['--check', '--', '--plugin=./x.js'])
+    expect(runs.find(r => r.argv[0] === 'ruff')!.argv).toEqual(['ruff', 'format', '--check', '--', 'api/app.py'])
+  })
+
+  test('a prettier that fails to start lets the push through', async ($, on) => {
+    const { ran, asked } = engine(on, { diff: 'web/app.ts\n', prettier: { fails: true } })
+    await $.tool.call({ tool: 'Bash', command: 'git push' } as any)
+    expect(asked).toEqual([])
+    expect(ran.map(e => e.command)).toEqual(['git push'])
+  })
+
+  test('an npm-installed prettier still checks the push', async ($, on) => {
+    const { asked, runs } = engine(on, { answer: 'Block it', diff: 'web/app.ts\n', prettier: {} })
+    const r: any = await $.tool.call({ tool: 'Bash', command: 'git push' } as any)
+    expect(runs.filter(r => r.argv[0].endsWith('prettier')).length).toBe(1)
+    expect(asked[0]).toMatch(/prettier: web\/app\.ts/)
+    expect(r.deny).toMatch(/not formatted/)
+  })
+
+  test('a cd outside the session folder is ignored; one inside is followed', async ($, on) => {
+    const { runs } = engine(on)
+    await $.tool.call({ tool: 'Bash', command: 'cd /tmp/evil && git push' } as any)
+    await $.tool.call({ tool: 'Bash', command: 'cd ../other && git push' } as any)
+    await $.tool.call({ tool: 'Bash', command: 'cd api && git push' } as any)
+    const tops = runs.filter(r => r.argv.includes('rev-parse')).map(r => r.cwd)
+    expect(tops).toEqual(['/repo', '/repo', '/repo/api'])
+  })
+
+  test('every git call turns the repo fsmonitor hook off', async ($, on) => {
+    const { runs } = engine(on, { diff: 'web/app.ts\n', prettier: {} })
+    await $.tool.call({ tool: 'Bash', command: 'git push' } as any)
+    const git = runs.filter(r => r.argv[0] === 'git')
+    expect(git.map(r => withoutOptions(r.argv.slice(1))[0])).toEqual(['rev-parse', 'diff', 'ls-files'])
+    for (const r of git) expect(r.argv.slice(1, 3)).toEqual(['-c', 'core.fsmonitor=false'])
   })
 })
