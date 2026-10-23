@@ -4,7 +4,7 @@
 //          them, a glow on what it touches right now, and one line on each change
 // A band line sums it up while Claude works.
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
 import type { MapFile, MissionNode } from '../types'
 import { importsOf, page, svg, textMap } from './map'
@@ -39,6 +39,7 @@ const now = atom({ plugin: 'mission-control', key: 'now' } as const, 0)
 // Drawing bookkeeping; a reload starts it over.
 const draw = { size: { columns: 100, rows: 30 }, pending: false, dirty: false, n: 0, error: '', isPageOpen: false }
 const changes = new Map<string, string[]>() // path → this turn's edits, for the one-line "why"
+const MAX_CHANGES = 5 // the first edit and the latest few per file are enough for the "why"
 // No Windows terminal draws pictures: there the map is lines in the pane and a page in the browser.
 let isWindows = false
 
@@ -62,11 +63,14 @@ function words(text: string, max: number) {
 let bandOrder: Promise<string[]> | undefined // read once per session: restart to apply
 
 export const register: Register = on => {
+  let timer: Timer | undefined // one clock, even if session.start fires again
+
   on('session.start', async ($, e, next) => {
     const r = await next(e)
     isWindows = (await $.env.get('OS')) === 'Windows_NT'
     await $.command.register({ name: 'mission', description: 'Open the live map of agents and tool calls; /mission code opens the code map', argumentHint: '[who|code]' }).catch(() => {})
-    $.clock.every(1000, () => {
+    timer?.cancel()
+    timer = $.clock.every(1000, () => {
       void (async () => {
         const busy = (await read($, nodes)).some(n => n.status === 'running')
         if (busy) await update($, now, () => Date.now())
@@ -125,7 +129,8 @@ export const register: Register = on => {
     }
     if (path && !failed && (e.tool === 'Edit' || e.tool === 'Write')) {
       const what = e.tool === 'Edit' ? `- ${String(args.old_string ?? '').slice(0, 300)}\n+ ${String(args.new_string ?? '').slice(0, 300)}` : `wrote ${String(args.content ?? '').slice(0, 400)}`
-      changes.set(path, [...(changes.get(path) ?? []), what])
+      const list = [...(changes.get(path) ?? []), what]
+      changes.set(path, list.length > MAX_CHANGES ? [list[0], ...list.slice(1 - MAX_CHANGES)] : list) // the first edit and the latest few
       await touch($, path, e.tool === 'Edit' ? 'edit' : 'write', true)
     }
     return r
@@ -154,7 +159,7 @@ export const register: Register = on => {
     const arg = e.args.trim().toLowerCase()
     if (arg === 'code' || arg === 'who') await update($, view, () => arg)
     await $.ui.open({ id: PANE, title: 'Mission Control', focus: true })
-    void renderSoon($)
+    void renderSoon($).catch(() => {})
     const s = summary(await read($, nodes))
     return { text: `Mission Control: ${s.agents} agents · ${s.tools} tool calls · ${(await read($, files)).length} files. w: who · c: code · q: close` }
   })
@@ -168,7 +173,7 @@ export const register: Register = on => {
     const head = (
       <Box flexDirection="row" gap={1}>
         <Button key="who" label="Who" hotkey="w" variant={v === 'who' ? 'primary' : undefined} onPress={() => update($, view, () => 'who')} />
-        <Button key="code" label="Code" hotkey="c" variant={v === 'code' ? 'primary' : undefined} onPress={() => void setCode($)} />
+        <Button key="code" label="Code" hotkey="c" variant={v === 'code' ? 'primary' : undefined} onPress={() => void setCode($).catch(() => {})} />
         {v === 'code' && isWindows && <Button key="open" label="Browser" hotkey="b" onPress={() => void openPage($).catch(() => {})} />}
         <Button key="close" label="Close" hotkey="q" role="dismiss" onPress={() => $.ui.close({ id: PANE })} />
       </Box>
@@ -210,7 +215,7 @@ export const register: Register = on => {
       const imageRows = Math.min(rows, Math.round(columns * 0.3))
       if (draw.size.columns !== columns || draw.size.rows !== imageRows) {
         draw.size = { columns, rows: imageRows }
-        void renderSoon($)
+        void renderSoon($).catch(() => {})
       }
       const f = await read($, frame)
       return (
@@ -365,7 +370,7 @@ async function renderMap($: EngineInterface) {
     return
   }
   draw.error = ''
-  const tmp = ((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/$/, '')
+  const tmp = ((await $.env.get('TMPDIR').catch(() => undefined)) ?? '/tmp').replace(/\/$/, '')
   const dir = `${tmp}/mission-control`
   const n = ++draw.n
   const width = Math.round(draw.size.columns * 9)

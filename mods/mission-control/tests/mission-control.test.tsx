@@ -259,6 +259,19 @@ describe('mission-control', () => {
     await again.unmount()
   })
 
+  test('a second session.start keeps one clock, not two', async ($, on) => {
+    const { clock } = engine(on)
+    let ticks = 0 // each tick with work running writes now once
+    on('state.set', (_$: any, e: any, next: any) => (e.key === 'now' && ticks++, next(e)))
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/repo' } as any)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/repo' } as any)
+    await $.turn.start({ text: 'fix the login bug', turnId: 't1' } as any) // main is running
+    ticks = 0
+    await clock.advance(1000)
+    await new Promise(done => (globalThis as any).setTimeout(done, 10))
+    expect(ticks).toBe(1)
+  })
+
   test('follows the band order file', async ($, on) => {
     // another band mod drew its column beneath
     const beneath = {

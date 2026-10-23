@@ -32,6 +32,7 @@ export function resetBandOrder() {
 export const register: Register = on => {
   let prompt = ''
   let log: string[] = []
+  let slash = false // the last message was a slash command, which may or may not start a turn
 
   on('session.start', async ($, e, next) => {
     const r = await next(e)
@@ -40,16 +41,30 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
+    // A slash command like /where answers nothing the last turn waited on, and may start no turn:
+    // leave the band as it is. One that does start a turn is picked up by turn.start.
+    if (e.text.startsWith('/')) {
+      slash = true
+      return next(e)
+    }
+    slash = false
     prompt = e.text.slice(0, 1500)
     log = []
     await update($, live, () => 'reading your message')
-    if (!e.text.startsWith('/')) await clearWaiting($) // a slash command like /where answers nothing the last turn waited on
+    await clearWaiting($)
     return next(e)
   })
 
   // A new turn of Claude's own: a summary of an older one is stale, and the person has answered.
   on('turn.start', async ($, e, next) => {
     if (!e.agentId) {
+      // A turn a slash command started: its text is the prompt. Other turns keep the person's
+      // own message, including ones Claude Code starts itself, like a background agent finishing.
+      if (slash && e.text) {
+        prompt = e.text.slice(0, 1500)
+        log = []
+      }
+      slash = false
       await update($, latest, () => e.turnId ?? '')
       await clearWaiting($)
     }
